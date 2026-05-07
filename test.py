@@ -1,17 +1,89 @@
 import sys
 import random
+import os
+import serial
+import struct
 from PySide6.QtWidgets import *
 from PySide6.QtCore import *
 from PySide6.QtGui import *
-import os
+
+# ================= CRSF ALICI THREAD'İ =================
+class CRSFReceiver(QThread):
+    telemetry_updated = Signal(dict)
+
+    def __init__(self, port='/dev/cu.usbserial-0001', baudrate=420000):
+        # macOS için varsayılan port adını "/dev/cu.usbserial-..." formatında bıraktım.
+        # Kendi adaptörüne göre port adını güncelleyebilirsin.
+        super().__init__()
+        self.port = port
+        self.baudrate = baudrate
+        self.running = True
+        
+        self.data = {
+            'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+            'lat': 39.123456, 'lon': 32.987654, 'alt': 0.0, 'speed': 0.0,
+            'batt_v': 0.0, 'batt_a': 0.0, 'cap': 0
+        }
+
+    def run(self):
+        try:
+            ser = serial.Serial(self.port, self.baudrate, timeout=1)
+            print(f"{self.port} portuna bağlanıldı. CRSF verisi bekleniyor...")
+            
+            while self.running:
+                if ser.in_waiting > 0:
+                    sync = ser.read(1)
+                    if sync == b'\xc8':
+                        length_byte = ser.read(1)
+                        if length_byte:
+                            length = ord(length_byte)
+                            if 0 < length <= 64:
+                                payload = ser.read(length)
+                                self.parse_frame(payload)
+                                self.telemetry_updated.emit(self.data)
+                                
+        except serial.SerialException as e:
+            print(f"Seri Port Hatası (Alıcı bağlı olmayabilir): {e}")
+
+    def parse_frame(self, payload):
+        if len(payload) < 2: return
+        
+        frame_type = payload[0]
+        data_bytes = payload[1:-1] 
+        
+        try:
+            if frame_type == 0x02 and len(data_bytes) >= 14: # GPS
+                lat, lon, speed, heading, alt, sats = struct.unpack('>iiHhHH', data_bytes[:14])
+                self.data['lat'] = lat / 10000000.0
+                self.data['lon'] = lon / 10000000.0
+                self.data['speed'] = speed / 36.0 
+                self.data['alt'] = alt - 1000 
+                
+            elif frame_type == 0x08 and len(data_bytes) >= 7: # Batarya
+                v, a, cap = struct.unpack('>HHH', data_bytes[:6])
+                self.data['batt_v'] = v / 10.0
+                self.data['batt_a'] = a / 10.0
+                self.data['cap'] = cap
+                
+            elif frame_type == 0x1E and len(data_bytes) >= 6: # Tutum (Attitude)
+                pitch, roll, yaw = struct.unpack('>hhh', data_bytes[:6])
+                self.data['pitch'] = pitch / 10000.0 * 57.2958
+                self.data['roll'] = roll / 10000.0 * 57.2958
+                self.data['yaw'] = yaw / 10000.0 * 57.2958
+                
+        except Exception:
+            pass 
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
 
 # ================= ÖZEL ÇİZİM WIDGET'LARI =================
 class CameraView(QWidget):
     def __init__(self):
         super().__init__()
-        # Yüklediğiniz resmi "kamera.jpg" olarak ayarlayın.
         file_name = "kamera.jpg" 
-        
         if os.path.exists(file_name):
             self.bg_pixmap = QPixmap(file_name)
         else:
@@ -21,7 +93,6 @@ class CameraView(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        
         if not self.bg_pixmap.isNull():
             scaled_pixmap = self.bg_pixmap.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             painter.drawPixmap(0, 0, scaled_pixmap)
@@ -30,76 +101,63 @@ class CameraView(QWidget):
             painter.setPen(Qt.white)
             painter.drawText(self.rect(), Qt.AlignCenter, "Resim Bulunamadı")
 
-
 class TacticalMap(QWidget):
-    def __init__(self):
+    def __init__(self, state_dict):
         super().__init__()
-        self.dist = 1.25  # Varsayılan başlangıç mesafesi
-
-    def update_distance(self, dist):
-        self.dist = dist
-        self.update()
+        self.state = state_dict 
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        cx, cy = w // 2, h // 2
-
-        # Arka plan
-        painter.fillRect(0, 0, w, h, QColor("#0d1117"))
-
-        # Izgara (Grid) Çizimi
-        painter.setPen(QPen(QColor("#161b22"), 1))
-        for i in range(0, w, 40):
-            painter.drawLine(i, 0, i, h)
-        for j in range(0, h, 40):
-            painter.drawLine(0, j, w, j)
-
-        # Radar Halkaları
-        painter.setPen(QPen(QColor("#30363d"), 1, Qt.DashLine))
-        for r in range(50, max(w, h), 100):
-            painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
-
-        # Eksen Çizgileri
-        painter.setPen(QPen(QColor("#30363d"), 2))
-        painter.drawLine(cx, 0, cx, h)
-        painter.drawLine(0, cy, w, cy)
-
-        # Hedef Konumu (Kırmızı Kare/Crosshair)
-        target_x, target_y = cx + 80, cy - 60
-        painter.setPen(QPen(QColor("#f85149"), 2))
-        painter.drawRect(target_x - 8, target_y - 8, 16, 16)
-        painter.drawLine(target_x - 12, target_y, target_x + 12, target_y)
-        painter.drawLine(target_x, target_y - 12, target_x, target_y + 12)
-
-        # AVCI ve HEDEF Arası Mesafe Çizgisi ve Metni
-        painter.setPen(QPen(QColor("#d29922"), 1, Qt.DashLine))
-        painter.drawLine(cx, cy, target_x, target_y)
         
-        mid_x = (cx + target_x) // 2
-        mid_y = (cy + target_y) // 2
-        painter.setFont(QFont("Arial", 9, QFont.Bold))
-        painter.setPen(QColor("#d29922"))
-        painter.drawText(mid_x - 20, mid_y - 10, f"{self.dist:.2f} km")
+        painter.fillRect(0, 0, w, h, QColor("#ffffff"))
+        painter.setPen(QPen(QColor("#f0f0f0"), 1))
+        for i in range(0, w, 40): painter.drawLine(i, 0, i, h)
+        for i in range(0, h, 40): painter.drawLine(0, i, w, i)
 
-        # Drone Konumu (Mavi Üçgen) - Çizginin üstünde kalması için en son çizilir
-        painter.setBrush(QColor("#58a6ff"))
-        painter.setPen(Qt.NoPen)
-        drone_poly = QPolygon([
-            QPoint(cx, cy - 10),
-            QPoint(cx - 7, cy + 8),
-            QPoint(cx + 7, cy + 8)
+        cx, cy = w // 2, h // 2
+        scale = 150 
+
+        avci_x, avci_y = cx - 50, cy + 50
+        target_dist_px = self.state['dist'] * scale
+        target_x = avci_x + target_dist_px
+        target_y = avci_y - target_dist_px
+
+        pen = QPen(QColor("#8b949e"), 2, Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawLine(avci_x, avci_y, target_x, target_y)
+
+        mid_x, mid_y = int((avci_x + target_x) / 2), int((avci_y + target_y) / 2)
+        painter.setPen(QColor("#21262d"))
+        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        painter.drawText(mid_x + 10, mid_y, f"{self.state['dist']:.2f} km")
+
+        painter.setBrush(QColor("#1f6feb"))
+        painter.setPen(QPen(Qt.white, 1))
+        avci_poly = QPolygon([
+            QPoint(avci_x, avci_y - 12),
+            QPoint(avci_x - 8, avci_y + 8),
+            QPoint(avci_x + 8, avci_y + 8)
         ])
-        painter.drawPolygon(drone_poly)
-
-        # Etiketler
+        t = QTransform()
+        t.translate(avci_x, avci_y)
+        t.rotate(self.state['yaw'])
+        t.translate(-avci_x, -avci_y)
+        painter.setTransform(t)
+        painter.drawPolygon(avci_poly)
+        painter.resetTransform()
+        
+        painter.setPen(QColor("#1f6feb"))
         painter.setFont(QFont("Arial", 8, QFont.Bold))
-        painter.setPen(QColor("#8b949e"))
-        painter.drawText(cx + 5, cy + 20, "AVCI")
-        painter.setPen(QColor("#f85149"))
-        painter.drawText(target_x + 12, target_y + 15, "HEDEF-01")
+        painter.drawText(avci_x - 15, avci_y + 22, "AVCI")
 
+        painter.setBrush(QColor("#f85149"))
+        painter.setPen(QPen(Qt.white, 1))
+        target_rect = QRect(int(target_x - 8), int(target_y - 8), 16, 16)
+        painter.drawRect(target_rect)
+        painter.setPen(QColor("#f85149"))
+        painter.drawText(int(target_x - 25), int(target_y - 12), "HEDEF")
 
 class ArtificialHorizon(QWidget):
     def __init__(self):
@@ -158,6 +216,10 @@ class MissionStages(QWidget):
         self.stages = ["KALKIŞ", "ARAMA", "TAKİP", "GÜDÜM", "ANGAJMAN"]
         self.current_stage = 2
 
+    def update_stage(self, stage):
+        self.current_stage = stage
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -201,62 +263,22 @@ class MissionStages(QWidget):
             tw = fm.horizontalAdvance(stage)
             painter.drawText(int(cx - tw/2), int(y + 22), stage)
 
-
-# ================= DATA SİMÜLASYONU =================
-class Sim:
-    def __init__(self):
-        self.speed, self.alt = 18.0, 120.0
-        self.roll, self.pitch, self.yaw = 12.0, 5.0, 23.0
-        self.dist = 1.25
-        self.impact_timer = 24.10
-        self.target_speed = 15.0   
-        
-        self.yolo_delay = 38
-        self.auto_delay = 76
-        self.total_delay = 114
-        
-        self.batt = 22.4
-        self.temp = 54
-        self.gcs_cpu = 32
-        self.gcs_gpu = 45
-        self.gcs_ram = 58
-        self.mission_stage = 2
-
-    def update(self):
-        self.speed += random.uniform(-0.5, 0.5)
-        self.alt += random.uniform(-1, 1)
-        self.roll += random.uniform(-1, 1)
-        self.pitch += random.uniform(-1, 1)
-        self.yaw += random.uniform(-2, 2)
-        
-        if self.dist > 0.05:
-            self.dist -= 0.005 
-            
-        if self.dist > 1.0: self.mission_stage = 1
-        elif self.dist > 0.7: self.mission_stage = 2
-        elif self.dist > 0.3: self.mission_stage = 3
-        else: self.mission_stage = 4
-
-        self.impact_timer -= 0.05 if self.impact_timer > 0 else 0
-        self.target_speed += random.uniform(-0.3, 0.3)  
-        
-        self.yolo_delay = random.randint(30, 45)
-        self.auto_delay = random.randint(60, 85)
-        self.total_delay = random.randint(100, 120)
-        
-        self.gcs_cpu = max(10, min(100, self.gcs_cpu + random.randint(-3, 3)))
-        self.gcs_gpu = max(10, min(100, self.gcs_gpu + random.randint(-4, 4)))
-        self.gcs_ram = max(10, min(100, self.gcs_ram + random.randint(-1, 1)))
-
-
 # ================= ANA ARAYÜZ =================
 class GCS(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AVCI DRONE YKİ")
+        self.setWindowTitle("AVCI DRONE YKİ - CRSF")
         self.resize(1600, 900)
         self.setStyleSheet("background-color: #010409; color: #c9d1d9; font-family: Arial;")
-        self.sim = Sim()
+        
+        # Arayüz state verileri (Uçuş verileri CRSF'ten gelecek, diğerleri GCS tarafından yönetilir)
+        self.state = {
+            'speed': 0.0, 'alt': 0.0, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
+            'lat': 39.123456, 'lon': 32.987654, 'batt_v': 22.4, 'temp': 54,
+            'dist': 1.25, 'target_speed': 15.0, 'impact_timer': 24.10,
+            'yolo_delay': 38, 'auto_delay': 76, 'total_delay': 114,
+            'gcs_cpu': 32, 'gcs_gpu': 45, 'gcs_ram': 58, 'mission_stage': 2
+        }
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -265,23 +287,26 @@ class GCS(QMainWindow):
         
         main_layout.addWidget(self.create_top_bar())
 
+        # ---- ÜST YERLEŞİM (TOP ROW) ----
         top_row = QHBoxLayout()
         self.cam_card = self.create_cam_card()
         self.map_card = self.create_map_card()
         
         top_right_panel = QVBoxLayout()
-        self.mission_card = self.create_mission_card()
-        self.gcs_card = self.create_gcs_card()
         self.status_card = self.create_status_card()
+        self.gcs_card = self.create_gcs_card()
+        self.mission_card = self.create_mission_card()
         
-        top_right_panel.addWidget(self.gcs_card, 3)
+        # Sıralama güncellendi: Sistem Durumu, Yer İstasyonu Bilgileri, Görev Aşamaları
         top_right_panel.addWidget(self.status_card, 2)
+        top_right_panel.addWidget(self.gcs_card, 3)
         top_right_panel.addWidget(self.mission_card, 3)
 
         top_row.addWidget(self.cam_card, 7)
         top_row.addWidget(self.map_card, 9)   
         top_row.addLayout(top_right_panel, 4)
 
+        # ---- ALT YERLEŞİM (BOTTOM ROW) ----
         bottom_row = QHBoxLayout()
         
         bottom_left_panel = QVBoxLayout()
@@ -312,12 +337,14 @@ class GCS(QMainWindow):
         main_layout.addLayout(bottom_row, 3)
         main_layout.addWidget(self.create_bottom_bar(), 1)
 
-        self.fast_timer = QTimer()
-        self.fast_timer.timeout.connect(self.update_fast)
-        self.fast_timer.start(100)  
+        # CRSF Thread Başlatma
+        self.crsf_thread = CRSFReceiver()
+        self.crsf_thread.telemetry_updated.connect(self.on_telemetry_received)
+        self.crsf_thread.start()
 
+        # Sensör dışı (YOLO, GCS yükü vb.) arayüz verilerini güncellemek için yavaş zamanlayıcı
         self.slow_timer = QTimer()
-        self.slow_timer.timeout.connect(self.update_slow)
+        self.slow_timer.timeout.connect(self.update_mock_system_data)
         self.slow_timer.start(400)  
 
     def base_card(self, title):
@@ -337,7 +364,7 @@ class GCS(QMainWindow):
         l.setContentsMargins(5, 0, 5, 0)
         title = QLabel("🚁 AVCI DRONE YKİ")
         title.setStyleSheet("font-weight: bold; font-size: 14px; color: #c9d1d9;")
-        status = QLabel("📶 Bağlantı: İyi   🛰️ GPS: 3D Fix (12)")
+        status = QLabel("📶 Bağlantı: İyi   🛰️ GPS: 3D Fix")
         status.setStyleSheet("color:#3fb950; font-weight:bold;")
         self.clock = QLabel("Saat: 00:00:00")
         l.addWidget(title); l.addStretch(); l.addWidget(status); l.addSpacing(20); l.addWidget(self.clock)
@@ -346,7 +373,6 @@ class GCS(QMainWindow):
     def create_cam_card(self):
         frame, l = self.base_card("📷 KAMERA & TESPİT")
         l.addWidget(CameraView(), 1)
-        
         info = QLabel("YOLO: Kilitli 🔒")
         info.setStyleSheet("color:#3fb950; border:none; font-size: 11px;")
         l.addWidget(info)
@@ -354,8 +380,8 @@ class GCS(QMainWindow):
 
     def create_map_card(self):
         frame, l = self.base_card("🗺️ TAKTİK HARİTA")
-        self.tactical_map = TacticalMap()  # Haritayı değişkene atadık (Dinamik güncelleme için)
-        l.addWidget(self.tactical_map, 1)
+        self.map_view = TacticalMap(self.state) 
+        l.addWidget(self.map_view, 1)
         btn_layout = QHBoxLayout()
         btn_start = QPushButton("▶ Görev Başlat")
         btn_start.setStyleSheet("background: #12331b; color: #3fb950; border: 1px solid #238636; border-radius: 4px; padding: 4px; font-weight:bold;")
@@ -449,7 +475,7 @@ class GCS(QMainWindow):
     def create_horizon_card(self):
         frame, l = self.base_card("✈️ AÇI DURUM GÖSTERGESİ")
         self.horizon = ArtificialHorizon()
-        self.att_lbl = QLabel("ROLL: 12°   PITCH: 5°   YAW: 23°")
+        self.att_lbl = QLabel("ROLL: 0°   PITCH: 0°   YAW: 0°")
         self.att_lbl.setAlignment(Qt.AlignCenter)
         self.att_lbl.setStyleSheet("border: none; color: #8b949e; font-size: 11px;")
         l.addWidget(self.horizon); l.addWidget(self.att_lbl)
@@ -515,43 +541,79 @@ class GCS(QMainWindow):
         else:
             self.map_card.showFullScreen()
 
-    def update_fast(self):
-        self.sim.update()
-        self.horizon.update_attitude(self.sim.roll, self.sim.pitch)
-        self.att_lbl.setText(f"ROLL: {self.sim.roll:.1f}°   PITCH: {self.sim.pitch:.1f}°   YAW: {self.sim.yaw:.1f}°")
-        
-        if self.mission_view.current_stage != self.sim.mission_stage:
-            self.mission_view.current_stage = self.sim.mission_stage
-            self.mission_view.update()
+    # --- CRSF THREAD'DEN GELEN VERİYİ ARAYÜZE İŞLEME ---
+    @Slot(dict)
+    def on_telemetry_received(self, data):
+        # State'i güncelle
+        for key, val in data.items():
+            self.state[key] = val
 
-    def update_slow(self):
+        # Açıları güncelle
+        self.horizon.update_attitude(self.state['roll'], self.state['pitch'])
+        self.att_lbl.setText(f"ROLL: {self.state['roll']:.1f}°   PITCH: {self.state['pitch']:.1f}°   YAW: {self.state['yaw']:.1f}°")
+        
+        # Haritayı yeniden çizdir
+        self.map_view.update()
+
+        # Batarya güncellemesi
+        self.drone_bars['batt'][0].setValue(int(self.state['batt_v'] * 4)) 
+        self.drone_bars['batt'][1].setText(f"{self.state['batt_v']:.1f} V")
+        self.drone_bars['temp'][0].setValue(int(self.state['temp']))
+        self.drone_bars['temp'][1].setText(f"{int(self.state['temp'])} °C")
+
+    # --- SENSÖR DIŞI (EKSTRA) VERİLERİN GÜNCELLENMESİ ---
+    def update_mock_system_data(self):
         self.clock.setText(f"Saat: {QTime.currentTime().toString('HH:mm:ss')}")
-        self.distance_lbl.setText(f"HEDEFE MESAFE: {self.sim.dist:.2f} km")
         
-        # Haritadaki mesafeyi dinamik olarak güncelle
-        self.tactical_map.update_distance(self.sim.dist)
+        # Arayüzün boş kalmaması için hedef mesafe, gecikme ve işlemci değerlerini simüle etmeye devam ediyoruz
+        if self.state['dist'] > 0.05:
+            self.state['dist'] -= 0.005 
         
-        remaining = max(0, int(self.sim.impact_timer))
+        if self.state['dist'] > 1.0: self.mission_view.update_stage(1)
+        elif self.state['dist'] > 0.7: self.mission_view.update_stage(2)
+        elif self.state['dist'] > 0.3: self.mission_view.update_stage(3)
+        else: self.mission_view.update_stage(4)
+
+        self.state['impact_timer'] -= 0.05 if self.state['impact_timer'] > 0 else 0
+        self.state['yolo_delay'] = random.randint(30, 45)
+        self.state['auto_delay'] = random.randint(60, 85)
+        self.state['total_delay'] = random.randint(100, 120)
+        self.state['gcs_cpu'] = max(10, min(100, self.state['gcs_cpu'] + random.randint(-3, 3)))
+        self.state['gcs_gpu'] = max(10, min(100, self.state['gcs_gpu'] + random.randint(-4, 4)))
+        self.state['gcs_ram'] = max(10, min(100, self.state['gcs_ram'] + random.randint(-1, 1)))
+
+        self.distance_lbl.setText(f"HEDEFE MESAFE: {self.state['dist']:.2f} km")
+        remaining = max(0, int(self.state['impact_timer']))
         self.time_bar.setValue(int((remaining / 45.0) * 100)) 
         self.time_lbl.setText(f"Kalan Uçuş Süresi: {remaining} sn")
+
+        self.val_yolo.setText(f"{self.state['yolo_delay']} ms")
+        self.val_auto.setText(f"{self.state['auto_delay']} ms")
+        self.val_total.setText(f"{self.state['total_delay']} ms")
+
+        color_cpu = "#f85149" if self.state['gcs_cpu'] > 70 else "#58a6ff"
+        self.gcs_cpu_val.setStyleSheet(f"color: {color_cpu}; font-size: 16px; font-weight: bold; border: none;")
+        self.gcs_cpu_val.setText(f"{self.state['gcs_cpu']}%")
+        self.gcs_gpu_val.setText(f"{self.state['gcs_gpu']}%")
+        self.gcs_ram_val.setText(f"{self.state['gcs_ram']}%")
 
         tel_html = f"""
         <style> td {{ padding: 1px; font-size: 11px; color: #8b949e; }} .val {{ text-align: right; font-weight: bold; }} </style>
         <table width="100%">
-            <tr><td colspan="2" style="color:#58a6ff; font-weight:bold;">🔵 AVCI DRONE</td></tr>
-            <tr><td>Çizgisel Hız:</td><td class="val" style="color:#58a6ff;">{self.sim.speed:.1f} m/s</td></tr>
-            <tr><td>Yatış (Roll):</td><td class="val" style="color:#58a6ff;">{self.sim.roll:.1f}°</td></tr>
-            <tr><td>Dikilme (Pitch):</td><td class="val" style="color:#58a6ff;">{self.sim.pitch:.1f}°</td></tr>
-            <tr><td>Sapma (Yaw):</td><td class="val" style="color:#58a6ff;">{self.sim.yaw:.1f}°</td></tr>
-            <tr><td>Enlem (Lat):</td><td class="val" style="color:#58a6ff;">39.123456° N</td></tr>
-            <tr><td>Boylam (Lon):</td><td class="val" style="color:#58a6ff;">32.987654° E</td></tr>
-            <tr><td>İrtifa:</td><td class="val" style="color:#58a6ff;">{self.sim.alt:.1f} m</td></tr>
+            <tr><td colspan="2" style="color:#58a6ff; font-weight:bold;">🔵 AVCI DRONE (CRSF VERİSİ)</td></tr>
+            <tr><td>Çizgisel Hız:</td><td class="val" style="color:#58a6ff;">{self.state['speed']:.1f} m/s</td></tr>
+            <tr><td>Yatış (Roll):</td><td class="val" style="color:#58a6ff;">{self.state['roll']:.1f}°</td></tr>
+            <tr><td>Dikilme (Pitch):</td><td class="val" style="color:#58a6ff;">{self.state['pitch']:.1f}°</td></tr>
+            <tr><td>Sapma (Yaw):</td><td class="val" style="color:#58a6ff;">{self.state['yaw']:.1f}°</td></tr>
+            <tr><td>Enlem (Lat):</td><td class="val" style="color:#58a6ff;">{self.state['lat']:.6f}° N</td></tr>
+            <tr><td>Boylam (Lon):</td><td class="val" style="color:#58a6ff;">{self.state['lon']:.6f}° E</td></tr>
+            <tr><td>İrtifa:</td><td class="val" style="color:#58a6ff;">{self.state['alt']:.1f} m</td></tr>
             <tr><td colspan="2"><hr style="border:0.5px solid #30363d; margin: 2px 0;"></td></tr>
             <tr><td colspan="2" style="color:#f85149; font-weight:bold;">🔴 HEDEF İHA</td></tr>
             <tr><td>Enlem (Lat):</td><td class="val" style="color:#f85149;">39.120123° N</td></tr>
             <tr><td>Boylam (Lon):</td><td class="val" style="color:#f85149;">32.991234° E</td></tr>
             <tr><td>İrtifa:</td><td class="val" style="color:#f85149;">150.0 m</td></tr>
-            <tr><td>Hız:</td><td class="val" style="color:#f85149;">{self.sim.target_speed:.1f} m/s</td></tr>
+            <tr><td>Hız:</td><td class="val" style="color:#f85149;">{self.state['target_speed']:.1f} m/s</td></tr>
         </table>
         """
         self.tel_lbl.setText(tel_html)
@@ -568,23 +630,12 @@ class GCS(QMainWindow):
         """
         self.guide_lbl.setText(guide_html)
         
-        decision_text = "İMHA / YAKALAMA" if self.sim.dist < 0.5 else "TAKİP"
+        decision_text = "İMHA / YAKALAMA" if self.state['dist'] < 0.5 else "TAKİP"
         self.last_decision.setText(decision_text)
 
-        self.val_yolo.setText(f"{self.sim.yolo_delay} ms")
-        self.val_auto.setText(f"{self.sim.auto_delay} ms")
-        self.val_total.setText(f"{self.sim.total_delay} ms")
-
-        color_cpu = "#f85149" if self.sim.gcs_cpu > 70 else "#58a6ff"
-        self.gcs_cpu_val.setStyleSheet(f"color: {color_cpu}; font-size: 16px; font-weight: bold; border: none;")
-        self.gcs_cpu_val.setText(f"{self.sim.gcs_cpu}%")
-        self.gcs_gpu_val.setText(f"{self.sim.gcs_gpu}%")
-        self.gcs_ram_val.setText(f"{self.sim.gcs_ram}%")
-
-        self.drone_bars['batt'][0].setValue(int(self.sim.batt*4))
-        self.drone_bars['batt'][1].setText(f"{self.sim.batt:.1f} V")
-        self.drone_bars['temp'][0].setValue(int(self.sim.temp))
-        self.drone_bars['temp'][1].setText(f"{int(self.sim.temp)} °C")
+    def closeEvent(self, event):
+        self.crsf_thread.stop()
+        super().closeEvent(event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
