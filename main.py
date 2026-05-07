@@ -357,11 +357,9 @@ class GCS(QMainWindow):
         
         info = QLabel("YOLO: Kilitli 🔒")
         info.setStyleSheet("color:#3fb950; border:none; font-size: 11px;")
-        btn = QPushButton("📹 Kameraya Bağlan")
-        btn.setStyleSheet("background: #0d2b4f; color: #58a6ff; border: 1px solid #1f6feb; border-radius: 4px; padding: 4px; font-weight:bold;")
         
+        # Buton oluşturma ve layout'a ekleme kısımları kaldırıldı
         l.addWidget(info)
-        l.addWidget(btn)
         return frame
 
     def create_map_card(self):
